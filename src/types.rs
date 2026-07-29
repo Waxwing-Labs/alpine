@@ -154,6 +154,45 @@ pub enum Role {
 // Request / Response
 // ---------------------------------------------------------------------------
 
+/// Extended-thinking (reasoning) configuration. Honored by providers that
+/// support it (Anthropic); ignored by those that don't (Ollama).
+#[derive(Debug, Clone)]
+pub enum ThinkingConfig {
+    /// Adaptive extended thinking (Claude 4.6+ / 5). The model decides how much
+    /// to reason; bound overall spend with `effort` (Anthropic's
+    /// `output_config.effort`) so it leaves room in `max_tokens` for a visible
+    /// answer. `display = Summarized` streams readable reasoning summaries
+    /// (surfaced as [`StreamChunk::Thinking`]); `Omitted` (Anthropic's default)
+    /// yields empty thinking text. Anthropic disallows a custom `temperature`
+    /// alongside thinking.
+    Adaptive { display: ThinkingDisplay, effort: Option<Effort> },
+    /// Explicitly disable extended thinking (direct answer).
+    Disabled,
+    /// Legacy fixed-budget thinking. Pre-4.6 models only — 400s on Claude 4.7+/5
+    /// (which removed `budget_tokens` in favor of adaptive thinking + effort).
+    Enabled { budget_tokens: u32 },
+}
+
+/// Whether a provider returns readable reasoning summaries or hides them.
+#[derive(Debug, Clone, Copy)]
+pub enum ThinkingDisplay {
+    /// Stream a human-readable summary of the reasoning.
+    Summarized,
+    /// Omit reasoning text (Anthropic's default) — thinking still happens.
+    Omitted,
+}
+
+/// Reasoning-effort hint, mapped to Anthropic's `output_config.effort`. Lower
+/// effort means less time spent reasoning (and lower cost/latency).
+#[derive(Debug, Clone, Copy)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Request {
     pub messages: Vec<Message>,
@@ -165,6 +204,9 @@ pub struct Request {
     /// Tools the model may call. Empty (the default) means no tool calling —
     /// identical behavior to before tool support existed.
     pub tools: Vec<ToolDefinition>,
+    /// Extended-thinking control. `None` (default) sends no `thinking` field,
+    /// preserving each provider's default behavior.
+    pub thinking: Option<ThinkingConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,7 +318,13 @@ impl std::fmt::Display for Response {
 
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
+    /// A chunk of the model's visible answer text.
     Delta(String),
+    /// A chunk of the model's *reasoning* (extended-thinking) text. Emitted only
+    /// by providers/models that stream a thinking block. Kept distinct from
+    /// [`StreamChunk::Delta`] so a host can render it separately (a live
+    /// "thinking…" view) and exclude it from the persisted answer.
+    Thinking(String),
     Done { usage: Option<Usage> },
     Error(String),
 }

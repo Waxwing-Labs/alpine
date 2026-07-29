@@ -6,7 +6,8 @@ use serde::Serialize;
 use crate::error::ProviderError;
 use crate::provider::Provider;
 use crate::types::{
-    ContentBlock, FinishReason, ModelId, Request, Response, Role, StreamChunk, StreamResponse,
+    ContentBlock, Effort, FinishReason, ModelId, Request, Response, Role, StreamChunk,
+    StreamResponse, ThinkingConfig, ThinkingDisplay,
     ToolDefinition, ToolUse, Usage,
 };
 
@@ -198,6 +199,16 @@ fn try_parse_sse_frame(buf: &mut String) -> Option<SseFrame> {
     match event_type {
         "content_block_delta" => {
             let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+            // Extended thinking streams a `thinking_delta` carrying `delta.thinking`
+            // (and a trailing `signature_delta` we ignore). Surface reasoning text
+            // as a distinct chunk so hosts can render it apart from the answer.
+            if let Some(thinking) = v["delta"]["thinking"].as_str() {
+                return if thinking.is_empty() {
+                    Some(SseFrame::Skip)
+                } else {
+                    Some(SseFrame::Chunk(StreamChunk::Thinking(thinking.to_string())))
+                };
+            }
             let text = v["delta"]["text"].as_str().unwrap_or("").to_string();
             if text.is_empty() {
                 Some(SseFrame::Skip)
@@ -249,6 +260,10 @@ struct MessagesRequest {
     // ({name, description, input_schema}), so we serialize it directly.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<serde_json::Value>,
     stream: bool,
 }
 
@@ -288,6 +303,23 @@ fn blocks_to_anthropic(content: &[ContentBlock]) -> serde_json::Value {
         })
         .collect();
     serde_json::Value::Array(arr)
+}
+
+fn display_str(d: ThinkingDisplay) -> &'static str {
+    match d {
+        ThinkingDisplay::Summarized => "summarized",
+        ThinkingDisplay::Omitted => "omitted",
+    }
+}
+
+fn effort_str(e: Effort) -> &'static str {
+    match e {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
+    }
 }
 
 impl MessagesRequest {
@@ -331,14 +363,44 @@ impl MessagesRequest {
             Some(system_parts.join("\n"))
         };
 
+        let thinking = req.thinking.as_ref().map(|t| match t {
+            ThinkingConfig::Adaptive { display, .. } => serde_json::json!({
+                "type": "adaptive",
+                "display": display_str(*display),
+            }),
+            ThinkingConfig::Disabled => serde_json::json!({ "type": "disabled" }),
+            ThinkingConfig::Enabled { budget_tokens } => serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+            }),
+        });
+
+        // `effort` rides on the adaptive variant but serializes to the separate
+        // top-level `output_config.effort` field.
+        let output_config = match &req.thinking {
+            Some(ThinkingConfig::Adaptive { effort: Some(e), .. }) => {
+                Some(serde_json::json!({ "effort": effort_str(*e) }))
+            }
+            _ => None,
+        };
+
+        // Anthropic rejects a custom `temperature` when extended thinking is
+        // active (adaptive or legacy budgeted). Drop it in that case.
+        let temperature = match &req.thinking {
+            Some(ThinkingConfig::Adaptive { .. }) | Some(ThinkingConfig::Enabled { .. }) => None,
+            _ => req.temperature,
+        };
+
         Self {
             model,
             messages,
             max_tokens,
             system,
-            temperature: req.temperature,
+            temperature,
             stop_sequences: req.stop.clone(),
             tools: req.tools.clone(),
+            thinking,
+            output_config,
             stream,
         }
     }
@@ -512,6 +574,32 @@ mod tests {
     }
 
     #[test]
+    fn sse_content_block_delta_thinking() {
+        let mut buf =
+            "event: content_block_delta\ndata: {\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me consider\"}}\n\n"
+                .to_string();
+        match try_parse_sse_frame(&mut buf) {
+            Some(SseFrame::Chunk(StreamChunk::Thinking(t))) => assert_eq!(t, "let me consider"),
+            other => panic!("expected Chunk(Thinking), got {other:?}"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn sse_content_block_delta_signature_is_skipped() {
+        // The trailing signature_delta of a thinking block has neither `thinking`
+        // nor `text`, so it must be skipped rather than emitted.
+        let mut buf =
+            "event: content_block_delta\ndata: {\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n"
+                .to_string();
+        match try_parse_sse_frame(&mut buf) {
+            Some(SseFrame::Skip) => {}
+            other => panic!("expected Skip, got {other:?}"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn sse_content_block_delta_empty_text() {
         let mut buf =
             "event: content_block_delta\ndata: {\"delta\":{\"text\":\"\"}}\n\n".to_string();
@@ -667,6 +755,76 @@ mod tests {
         };
         let mr = MessagesRequest::from_request(&req, &ModelId::new("m"), false);
         assert_eq!(mr.max_tokens, 1000);
+    }
+
+    #[test]
+    fn msg_request_thinking_enabled_serializes_and_drops_temperature() {
+        let req = Request {
+            max_tokens: Some(8192),
+            temperature: Some(0.7), // must be dropped when thinking is enabled
+            thinking: Some(ThinkingConfig::Enabled { budget_tokens: 4096 }),
+            ..Default::default()
+        };
+        let mr = MessagesRequest::from_request(&req, &ModelId::new("m"), false);
+        assert!(mr.temperature.is_none());
+        let v = serde_json::to_value(&mr).unwrap();
+        assert_eq!(v["thinking"]["type"], "enabled");
+        assert_eq!(v["thinking"]["budget_tokens"], 4096);
+        assert!(v.get("temperature").is_none());
+    }
+
+    #[test]
+    fn msg_request_thinking_adaptive_serializes_thinking_and_effort() {
+        let req = Request {
+            max_tokens: Some(8192),
+            temperature: Some(0.7), // dropped when thinking is active
+            thinking: Some(ThinkingConfig::Adaptive {
+                display: ThinkingDisplay::Summarized,
+                effort: Some(Effort::Medium),
+            }),
+            ..Default::default()
+        };
+        let mr = MessagesRequest::from_request(&req, &ModelId::new("m"), false);
+        assert!(mr.temperature.is_none());
+        let v = serde_json::to_value(&mr).unwrap();
+        assert_eq!(v["thinking"]["type"], "adaptive");
+        assert_eq!(v["thinking"]["display"], "summarized");
+        assert_eq!(v["output_config"]["effort"], "medium");
+        assert!(v.get("temperature").is_none());
+    }
+
+    #[test]
+    fn msg_request_thinking_adaptive_without_effort_omits_output_config() {
+        let req = Request {
+            thinking: Some(ThinkingConfig::Adaptive {
+                display: ThinkingDisplay::Omitted,
+                effort: None,
+            }),
+            ..Default::default()
+        };
+        let mr = MessagesRequest::from_request(&req, &ModelId::new("m"), false);
+        let v = serde_json::to_value(&mr).unwrap();
+        assert_eq!(v["thinking"]["display"], "omitted");
+        assert!(v.get("output_config").is_none());
+    }
+
+    #[test]
+    fn msg_request_thinking_disabled_serializes() {
+        let req = Request {
+            thinking: Some(ThinkingConfig::Disabled),
+            ..Default::default()
+        };
+        let mr = MessagesRequest::from_request(&req, &ModelId::new("m"), false);
+        let v = serde_json::to_value(&mr).unwrap();
+        assert_eq!(v["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn msg_request_no_thinking_omits_field() {
+        let req = Request::default();
+        let mr = MessagesRequest::from_request(&req, &ModelId::new("m"), false);
+        let v = serde_json::to_value(&mr).unwrap();
+        assert!(v.get("thinking").is_none());
     }
 
     #[test]
@@ -911,6 +1069,7 @@ mod tests {
         while let Some(chunk) = stream.next().await {
             match chunk {
                 StreamChunk::Delta(t) => text.push_str(&t),
+                StreamChunk::Thinking(_) => {}
                 StreamChunk::Done { usage } => {
                     got_done = true;
                     let u = usage.unwrap();
