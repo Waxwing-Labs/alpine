@@ -7,8 +7,7 @@ use crate::error::ProviderError;
 use crate::provider::Provider;
 use crate::types::{
     ContentBlock, Effort, FinishReason, ModelId, Request, Response, Role, StreamChunk,
-    StreamResponse, ThinkingConfig, ThinkingDisplay,
-    ToolDefinition, ToolUse, Usage,
+    StreamResponse, ThinkingConfig, ThinkingDisplay, ToolDefinition, ToolUse, Usage,
 };
 
 const API_BASE: &str = "https://api.anthropic.com";
@@ -105,6 +104,7 @@ impl Provider for AnthropicProvider {
                 inner: Box::pin(byte_stream),
                 buf: String::new(),
                 done: false,
+                ctx: SseParseCtx::default(),
             },
             |mut state| async move {
                 if state.done {
@@ -113,7 +113,8 @@ impl Provider for AnthropicProvider {
 
                 loop {
                     // Try to extract a complete SSE frame from the buffer.
-                    if let Some(chunk) = try_parse_sse_frame(&mut state.buf) {
+                    let SseState { buf, ctx, .. } = &mut state;
+                    if let Some(chunk) = try_parse_sse_frame(buf, ctx) {
                         match chunk {
                             SseFrame::Chunk(c) => return Some((c, state)),
                             SseFrame::Done(usage) => {
@@ -165,6 +166,23 @@ struct SseState {
         std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     buf: String,
     done: bool,
+    ctx: SseParseCtx,
+}
+
+/// Cross-frame parse state: what earlier SSE frames established about the
+/// message in flight. Frame parsing itself stays line-local; these two facts
+/// are the only ones that outlive a frame.
+#[derive(Default)]
+struct SseParseCtx {
+    /// From `message_start` — the closing `message_delta` usage carries only
+    /// `output_tokens`, so the input count must be remembered until then or
+    /// every streamed response reports zero input tokens.
+    input_tokens: Option<u32>,
+    /// True while inside a thinking-family content block (`thinking`,
+    /// `summarized_thinking`, …). Reasoning that streams as plain
+    /// `text_delta`s inside such a block must surface as `Thinking`, never
+    /// `Delta` — otherwise hosts persist the reasoning into the answer.
+    in_thinking_block: bool,
 }
 
 #[derive(Debug)]
@@ -175,8 +193,10 @@ enum SseFrame {
 }
 
 /// Try to consume one complete SSE frame (`event: ...\ndata: ...\n\n`) from
-/// the buffer. Returns `None` if there isn't a complete frame yet.
-fn try_parse_sse_frame(buf: &mut String) -> Option<SseFrame> {
+/// the buffer. Returns `None` if there isn't a complete frame yet. `ctx`
+/// carries the little cross-frame state a frame can establish (input token
+/// count, whether we're inside a thinking block).
+fn try_parse_sse_frame(buf: &mut String, ctx: &mut SseParseCtx) -> Option<SseFrame> {
     // SSE frames are terminated by a blank line (\n\n).
     let frame_end = buf.find("\n\n")?;
     let frame: String = buf.drain(..frame_end + 2).collect();
@@ -212,23 +232,45 @@ fn try_parse_sse_frame(buf: &mut String) -> Option<SseFrame> {
             let text = v["delta"]["text"].as_str().unwrap_or("").to_string();
             if text.is_empty() {
                 Some(SseFrame::Skip)
+            } else if ctx.in_thinking_block {
+                // A thinking-family block whose deltas arrive as plain
+                // `text_delta`s (display-shape dependent). It is reasoning,
+                // not answer — a host that buffered it as Delta would persist
+                // the thinking into the reply.
+                Some(SseFrame::Chunk(StreamChunk::Thinking(text)))
             } else {
                 Some(SseFrame::Chunk(StreamChunk::Delta(text)))
             }
         }
         "message_delta" => {
-            // Contains stop_reason and final usage.
+            // Contains stop_reason and final usage — output side only. The
+            // input count arrived in `message_start` and was parked in `ctx`.
             let v: serde_json::Value = serde_json::from_str(&data).ok()?;
             let output_tokens = v["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
             Some(SseFrame::Done(Some(Usage {
-                input_tokens: 0, // input tokens come in message_start
+                input_tokens: ctx.input_tokens.unwrap_or(0),
                 output_tokens,
             })))
         }
         "message_stop" => Some(SseFrame::Skip),
-        "message_start" | "content_block_start" | "content_block_stop" | "ping" => {
+        "message_start" => {
+            let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+            if let Some(n) = v["message"]["usage"]["input_tokens"].as_u64() {
+                ctx.input_tokens = Some(n as u32);
+            }
             Some(SseFrame::Skip)
         }
+        "content_block_start" => {
+            let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+            let block_type = v["content_block"]["type"].as_str().unwrap_or("");
+            ctx.in_thinking_block = block_type.contains("thinking");
+            Some(SseFrame::Skip)
+        }
+        "content_block_stop" => {
+            ctx.in_thinking_block = false;
+            Some(SseFrame::Skip)
+        }
+        "ping" => Some(SseFrame::Skip),
         "error" => {
             let v: serde_json::Value = serde_json::from_str(&data).ok()?;
             let msg = v["error"]["message"]
@@ -378,9 +420,9 @@ impl MessagesRequest {
         // `effort` rides on the adaptive variant but serializes to the separate
         // top-level `output_config.effort` field.
         let output_config = match &req.thinking {
-            Some(ThinkingConfig::Adaptive { effort: Some(e), .. }) => {
-                Some(serde_json::json!({ "effort": effort_str(*e) }))
-            }
+            Some(ThinkingConfig::Adaptive {
+                effort: Some(e), ..
+            }) => Some(serde_json::json!({ "effort": effort_str(*e) })),
             _ => None,
         };
 
@@ -556,17 +598,19 @@ mod tests {
 
     #[test]
     fn sse_incomplete_frame() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: ping\ndata: {}\n".to_string(); // no \n\n
         let original_len = buf.len();
-        assert!(try_parse_sse_frame(&mut buf).is_none());
+        assert!(try_parse_sse_frame(&mut buf, &mut ctx).is_none());
         assert_eq!(buf.len(), original_len); // buffer not drained
     }
 
     #[test]
     fn sse_content_block_delta() {
+        let mut ctx = SseParseCtx::default();
         let mut buf =
             "event: content_block_delta\ndata: {\"delta\":{\"text\":\"hi\"}}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Chunk(StreamChunk::Delta(t))) => assert_eq!(t, "hi"),
             other => panic!("expected Chunk(Delta), got {other:?}"),
         }
@@ -575,10 +619,11 @@ mod tests {
 
     #[test]
     fn sse_content_block_delta_thinking() {
+        let mut ctx = SseParseCtx::default();
         let mut buf =
             "event: content_block_delta\ndata: {\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me consider\"}}\n\n"
                 .to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Chunk(StreamChunk::Thinking(t))) => assert_eq!(t, "let me consider"),
             other => panic!("expected Chunk(Thinking), got {other:?}"),
         }
@@ -589,10 +634,11 @@ mod tests {
     fn sse_content_block_delta_signature_is_skipped() {
         // The trailing signature_delta of a thinking block has neither `thinking`
         // nor `text`, so it must be skipped rather than emitted.
+        let mut ctx = SseParseCtx::default();
         let mut buf =
             "event: content_block_delta\ndata: {\"delta\":{\"type\":\"signature_delta\",\"signature\":\"abc\"}}\n\n"
                 .to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Skip) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -601,9 +647,10 @@ mod tests {
 
     #[test]
     fn sse_content_block_delta_empty_text() {
+        let mut ctx = SseParseCtx::default();
         let mut buf =
             "event: content_block_delta\ndata: {\"delta\":{\"text\":\"\"}}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Skip) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -611,10 +658,12 @@ mod tests {
 
     #[test]
     fn sse_message_delta() {
+        let mut ctx = SseParseCtx::default();
         let mut buf =
             "event: message_delta\ndata: {\"usage\":{\"output_tokens\":42}}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Done(Some(usage))) => {
+                // No message_start seen (degenerate stream): input honestly 0.
                 assert_eq!(usage.input_tokens, 0);
                 assert_eq!(usage.output_tokens, 42);
             }
@@ -623,9 +672,81 @@ mod tests {
     }
 
     #[test]
+    fn sse_input_tokens_carry_from_message_start_to_done() {
+        // Anthropic reports input tokens ONLY in message_start; the closing
+        // message_delta carries just output usage. Dropping the start's count
+        // is how every streamed chat came out `input_tokens: 0`.
+        let mut ctx = SseParseCtx::default();
+        let mut buf = concat!(
+            "event: message_start\n",
+            "data: {\"message\":{\"usage\":{\"input_tokens\":4321,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"usage\":{\"output_tokens\":42}}\n\n",
+        )
+        .to_string();
+        assert!(matches!(
+            try_parse_sse_frame(&mut buf, &mut ctx),
+            Some(SseFrame::Skip)
+        ));
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
+            Some(SseFrame::Done(Some(usage))) => {
+                assert_eq!(
+                    usage.input_tokens, 4321,
+                    "message_start count must be carried"
+                );
+                assert_eq!(usage.output_tokens, 42);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_text_deltas_inside_a_thinking_block_are_thinking() {
+        // Some display shapes stream reasoning as plain text_deltas inside a
+        // `*thinking*`-typed content block. Those are reasoning, not answer —
+        // a host that buffers Delta chunks would persist the thinking into
+        // the reply. The block type governs classification.
+        let mut ctx = SseParseCtx::default();
+        let mut buf = concat!(
+            "event: content_block_start\n",
+            "data: {\"content_block\":{\"type\":\"summarized_thinking\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"weighing options\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {}\n\n",
+            "event: content_block_start\n",
+            "data: {\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"the answer\"}}\n\n",
+        )
+        .to_string();
+        assert!(matches!(
+            try_parse_sse_frame(&mut buf, &mut ctx),
+            Some(SseFrame::Skip)
+        ));
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
+            Some(SseFrame::Chunk(StreamChunk::Thinking(t))) => assert_eq!(t, "weighing options"),
+            other => panic!("expected Thinking inside the block, got {other:?}"),
+        }
+        assert!(matches!(
+            try_parse_sse_frame(&mut buf, &mut ctx),
+            Some(SseFrame::Skip)
+        ));
+        assert!(matches!(
+            try_parse_sse_frame(&mut buf, &mut ctx),
+            Some(SseFrame::Skip)
+        ));
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
+            Some(SseFrame::Chunk(StreamChunk::Delta(t))) => assert_eq!(t, "the answer"),
+            other => panic!("expected Delta after the block closed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sse_message_stop() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: message_stop\ndata: {}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Skip) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -633,8 +754,9 @@ mod tests {
 
     #[test]
     fn sse_message_start() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: message_start\ndata: {}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Skip) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -642,8 +764,9 @@ mod tests {
 
     #[test]
     fn sse_content_block_start() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: content_block_start\ndata: {}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Skip) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -651,8 +774,9 @@ mod tests {
 
     #[test]
     fn sse_content_block_stop() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: content_block_stop\ndata: {}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Skip) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -660,8 +784,9 @@ mod tests {
 
     #[test]
     fn sse_ping() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: ping\ndata: {}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Skip) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -669,9 +794,10 @@ mod tests {
 
     #[test]
     fn sse_error_event() {
+        let mut ctx = SseParseCtx::default();
         let mut buf =
             "event: error\ndata: {\"error\":{\"message\":\"overloaded\"}}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Chunk(StreamChunk::Error(msg))) => assert_eq!(msg, "overloaded"),
             other => panic!("expected Error chunk, got {other:?}"),
         }
@@ -679,8 +805,9 @@ mod tests {
 
     #[test]
     fn sse_error_no_message() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: error\ndata: {\"error\":{}}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Chunk(StreamChunk::Error(msg))) => assert_eq!(msg, "unknown error"),
             other => panic!("expected Error chunk with unknown, got {other:?}"),
         }
@@ -688,8 +815,9 @@ mod tests {
 
     #[test]
     fn sse_unknown_event() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: custom_thing\ndata: {}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Skip) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -697,9 +825,10 @@ mod tests {
 
     #[test]
     fn sse_no_space_after_colon() {
+        let mut ctx = SseParseCtx::default();
         let mut buf =
             "event:content_block_delta\ndata:{\"delta\":{\"text\":\"x\"}}\n\n".to_string();
-        match try_parse_sse_frame(&mut buf) {
+        match try_parse_sse_frame(&mut buf, &mut ctx) {
             Some(SseFrame::Chunk(StreamChunk::Delta(t))) => assert_eq!(t, "x"),
             other => panic!("expected Delta, got {other:?}"),
         }
@@ -707,17 +836,19 @@ mod tests {
 
     #[test]
     fn sse_invalid_json_returns_none() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: content_block_delta\ndata: not-json\n\n".to_string();
         // serde_json::from_str fails, .ok()? returns None
-        assert!(try_parse_sse_frame(&mut buf).is_none());
+        assert!(try_parse_sse_frame(&mut buf, &mut ctx).is_none());
     }
 
     #[test]
     fn sse_drains_buffer() {
+        let mut ctx = SseParseCtx::default();
         let mut buf = "event: ping\ndata: {}\n\nevent: message_stop\ndata: {}\n\n".to_string();
-        try_parse_sse_frame(&mut buf); // consume first frame
+        try_parse_sse_frame(&mut buf, &mut ctx); // consume first frame
         assert!(buf.starts_with("event: message_stop"));
-        try_parse_sse_frame(&mut buf); // consume second frame
+        try_parse_sse_frame(&mut buf, &mut ctx); // consume second frame
         assert!(buf.is_empty());
     }
 
@@ -762,7 +893,9 @@ mod tests {
         let req = Request {
             max_tokens: Some(8192),
             temperature: Some(0.7), // must be dropped when thinking is enabled
-            thinking: Some(ThinkingConfig::Enabled { budget_tokens: 4096 }),
+            thinking: Some(ThinkingConfig::Enabled {
+                budget_tokens: 4096,
+            }),
             ..Default::default()
         };
         let mr = MessagesRequest::from_request(&req, &ModelId::new("m"), false);

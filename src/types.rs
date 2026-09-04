@@ -165,7 +165,10 @@ pub enum ThinkingConfig {
     /// (surfaced as [`StreamChunk::Thinking`]); `Omitted` (Anthropic's default)
     /// yields empty thinking text. Anthropic disallows a custom `temperature`
     /// alongside thinking.
-    Adaptive { display: ThinkingDisplay, effort: Option<Effort> },
+    Adaptive {
+        display: ThinkingDisplay,
+        effort: Option<Effort>,
+    },
     /// Explicitly disable extended thinking (direct answer).
     Disabled,
     /// Legacy fixed-budget thinking. Pre-4.6 models only — 400s on Claude 4.7+/5
@@ -325,7 +328,9 @@ pub enum StreamChunk {
     /// [`StreamChunk::Delta`] so a host can render it separately (a live
     /// "thinking…" view) and exclude it from the persisted answer.
     Thinking(String),
-    Done { usage: Option<Usage> },
+    Done {
+        usage: Option<Usage>,
+    },
     Error(String),
 }
 
