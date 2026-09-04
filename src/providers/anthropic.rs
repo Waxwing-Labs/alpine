@@ -23,6 +23,7 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     model: ModelId,
+    extra_headers: Vec<(String, String)>,
 }
 
 impl AnthropicProvider {
@@ -32,6 +33,7 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: API_BASE.to_string(),
             model: ModelId::new(model),
+            extra_headers: Vec::new(),
         }
     }
 
@@ -45,15 +47,29 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: ModelId::new(model),
+            extra_headers: Vec::new(),
         }
     }
 
+    /// Add a header to every request this provider sends, e.g.
+    /// `anthropic-workspace-id` for API keys that are not scoped to a single
+    /// workspace, or an `anthropic-beta` feature flag.
+    pub fn with_extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
     fn request_builder(&self, url: &str) -> reqwest::RequestBuilder {
-        self.client
+        let mut builder = self
+            .client
             .post(url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        for (name, value) in &self.extra_headers {
+            builder = builder.header(name, value);
+        }
+        builder
     }
 }
 
@@ -1011,6 +1027,32 @@ mod tests {
         assert_eq!(resp.usage.output_tokens, 6);
         assert_eq!(resp.model.as_str(), "claude-sonnet-4-20250514");
         assert!(resp.latency > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn complete_sends_extra_headers() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-key"))
+            .and(header("anthropic-workspace-id", "wrkspc_123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response_json()))
+            .mount(&server)
+            .await;
+
+        let provider =
+            AnthropicProvider::with_base_url("test-key", "claude-sonnet-4-20250514", server.uri())
+                .with_extra_header("anthropic-workspace-id", "wrkspc_123");
+        let resp = provider
+            .complete(&Request {
+                messages: vec![Message::user("hi")],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.content, "Hello!");
     }
 
     #[tokio::test]
