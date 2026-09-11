@@ -120,6 +120,7 @@ impl Provider for AnthropicProvider {
             SseState {
                 inner: Box::pin(byte_stream),
                 buf: String::new(),
+                pending: Vec::new(),
                 done: false,
             },
             |mut state| async move {
@@ -142,13 +143,14 @@ impl Provider for AnthropicProvider {
 
                     // Need more data from the network.
                     match state.inner.next().await {
-                        Some(Ok(bytes)) => match std::str::from_utf8(&bytes) {
-                            Ok(s) => state.buf.push_str(s),
-                            Err(e) => {
+                        Some(Ok(bytes)) => {
+                            if let Err(e) =
+                                push_chunk_utf8(&mut state.buf, &mut state.pending, &bytes)
+                            {
                                 state.done = true;
                                 return Some((StreamChunk::Error(e.to_string()), state));
                             }
-                        },
+                        }
                         Some(Err(e)) => {
                             state.done = true;
                             return Some((StreamChunk::Error(e.to_string()), state));
@@ -180,7 +182,36 @@ struct SseState {
     inner:
         std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
     buf: String,
+    /// Trailing bytes of a UTF-8 character split across network chunks.
+    pending: Vec<u8>,
     done: bool,
+}
+
+/// Append a network chunk to the text buffer. HTTP chunk boundaries fall on
+/// arbitrary byte offsets, so a multi-byte UTF-8 character can straddle two
+/// chunks; the incomplete tail is carried in `pending` until the rest arrives.
+fn push_chunk_utf8(
+    buf: &mut String,
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Result<(), std::str::Utf8Error> {
+    pending.extend_from_slice(chunk);
+    match std::str::from_utf8(pending) {
+        Ok(s) => {
+            buf.push_str(s);
+            pending.clear();
+            Ok(())
+        }
+        // `error_len() == None` means the buffer ends mid-character: decode
+        // the valid prefix and keep the tail for the next chunk.
+        Err(e) if e.error_len().is_none() => {
+            let valid = e.valid_up_to();
+            buf.push_str(std::str::from_utf8(&pending[..valid]).expect("prefix is valid UTF-8"));
+            pending.drain(..valid);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Debug)]
@@ -482,6 +513,42 @@ mod tests {
     use std::time::Duration;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── push_chunk_utf8 ──────────────────────────────────────────────────
+
+    #[test]
+    fn utf8_char_split_across_chunks() {
+        // "…" is E2 80 A6; a chunk boundary in the middle must not error.
+        let text = "context truncated…done".as_bytes();
+        let (a, b) = text.split_at(text.iter().position(|&b| b == 0xE2).unwrap() + 1);
+        let mut buf = String::new();
+        let mut pending = Vec::new();
+        push_chunk_utf8(&mut buf, &mut pending, a).unwrap();
+        assert_eq!(buf, "context truncated");
+        assert_eq!(pending, [0xE2]);
+        push_chunk_utf8(&mut buf, &mut pending, b).unwrap();
+        assert_eq!(buf, "context truncated…done");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn utf8_char_split_one_byte_per_chunk() {
+        let mut buf = String::new();
+        let mut pending = Vec::new();
+        for byte in "🎉".as_bytes() {
+            push_chunk_utf8(&mut buf, &mut pending, &[*byte]).unwrap();
+        }
+        assert_eq!(buf, "🎉");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn utf8_genuinely_invalid_bytes_error() {
+        let mut buf = String::new();
+        let mut pending = Vec::new();
+        // 0xE2 followed by an ASCII byte can never form a valid character.
+        assert!(push_chunk_utf8(&mut buf, &mut pending, &[0xE2, b'x']).is_err());
+    }
 
     // ── parse_messages_response ──────────────────────────────────────────
 
